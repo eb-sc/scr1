@@ -1,4 +1,4 @@
-/// Copyright by Syntacore LLC © 2016, 2017. See LICENSE for details
+/// Copyright by Syntacore LLC © 2016-2018. See LICENSE for details
 /// @file       <scr1_dmem_ahb.sv>
 /// @brief      Data memory AHB bridge
 ///
@@ -327,7 +327,9 @@ always_ff @(negedge rst_n, posedge clk) begin
     end else begin
         case (fsm)
             SCR1_FSM_ADDR : begin
-                fsm <= (req_fifo_empty) ? SCR1_FSM_ADDR : SCR1_FSM_DATA;
+                if (hready) begin
+                    fsm <= (req_fifo_empty) ? SCR1_FSM_ADDR : SCR1_FSM_DATA;
+                end
             end
             SCR1_FSM_DATA : begin
                 if (hready) begin
@@ -349,11 +351,13 @@ always_comb begin
     req_fifo_rd = 1'b0;
     case (fsm)
         SCR1_FSM_ADDR : begin
-            req_fifo_rd = ~req_fifo_empty;
+            if (hready) begin
+                req_fifo_rd = ~req_fifo_empty;
+            end
         end
         SCR1_FSM_DATA : begin
             if (hready) begin
-                req_fifo_rd = ~req_fifo_empty;
+                req_fifo_rd = ~req_fifo_empty & (hresp == SCR1_HRESP_OKAY);
             end
         end
         default : begin

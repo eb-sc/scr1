@@ -1,6 +1,6 @@
-/// Copyright by Syntacore LLC © 2016, 2017. See LICENSE for details
+/// Copyright by Syntacore LLC © 2016-2019. See LICENSE for details
 /// @file       <scr1_pipe_exu.sv>
-/// @brief      Execution Unit
+/// @brief      Execution Unit (EXU)
 ///
 
 `include "scr1_arch_description.svh"
@@ -10,11 +10,11 @@
 `include "scr1_csr.svh"
 
 `ifdef SCR1_DBGC_EN
- `include "scr1_dbgc.svh"
+ `include "scr1_hdu.svh"
 `endif // SCR1_DBGC_EN
 
 `ifdef SCR1_BRKM_EN
- `include "scr1_brkm.svh"
+ `include "scr1_tdu.svh"
 `endif // SCR1_BRKM_EN
 
 module scr1_pipe_exu (
@@ -30,12 +30,10 @@ module scr1_pipe_exu (
     input   logic                               idu2exu_req,            // Request form IDU to EXU
     output  logic                               exu2idu_rdy,            // EXU ready for new data from IDU
     input   type_scr1_exu_cmd_s                 idu2exu_cmd,            // EXU command
-`ifndef SCR1_EXU_STAGE_BYPASS
     input   logic                               idu2exu_use_rs1,        // Clock gating on rs1_addr field
     input   logic                               idu2exu_use_rs2,        // Clock gating on rs2_addr field
     input   logic                               idu2exu_use_rd,         // Clock gating on rd_addr field
     input   logic                               idu2exu_use_imm,        // Clock gating on imm field
-`endif // SCR1_EXU_STAGE_BYPASS
 
     // EXU <-> MPRF interface
     output  logic [`SCR1_MPRF_ADDR_WIDTH-1:0]   exu2mprf_rs1_addr,      // MPRF rs1 read address
@@ -79,7 +77,7 @@ module scr1_pipe_exu (
 
     // EXU control
     output  logic                               exu_exc_req,            // Exception on last instruction
-    output  logic                               brkpt,                  // Breakpoint on current instruction
+    output  logic                               brkpt,                  // Software Breakpoint (EBREAK)
     output  logic                               exu_init_pc,            // Reset exit
     output  logic                               wfi_run2halt,           // Transition to WFI halted state
     output  logic                               instret,                // Instruction retired (with or without exception)
@@ -89,29 +87,30 @@ module scr1_pipe_exu (
     output  logic                               ialu_busy,              // IALU busy
 
 `ifdef SCR1_DBGC_EN
-    // EXU <-> DBGC interface
+    // EXU <-> HDU interface
     input   logic                               exu_no_commit,          // Forbid instruction commitment
     input   logic                               exu_irq_dsbl,           // Disable IRQ
     input   logic                               exu_pc_advmt_dsbl,      // Forbid PC advancement
     input   logic                               exu_dmode_sstep_en,     // Enable single-step
-    input   logic                               fetch_dbgc,             // Take instructions from DBGC
+    input   logic                               fetch_pbuf,             // Take instructions from Program Buffer
     input   logic                               dbg_halted,             // Debug halted state
     input   logic                               dbg_run2halt,           // Transition to debug halted state
     input   logic                               dbg_halt2run,           // Transition to run state
     input   logic                               dbg_run_start,          // First cycle of run state
+    input   logic [`SCR1_XLEN-1:0]              dbg_new_pc,             // New PC as starting point for HART Resume
 `endif // SCR1_DBGC_EN
 
 `ifdef SCR1_BRKM_EN
-    // EXU <-> BRKM interface
-    output type_scr1_brkm_instr_mon_s           exu2brkm_i_mon,         // Instruction monitor
-    input  logic [SCR1_BRKM_BRKPT_NUMBER-1:0]   brkm2exu_i_match,       // Instruction breakpoint(s) match
-    input  logic                                brkm2exu_i_x_req,       // Instruction breakpoint exception
-    output type_scr1_brkm_lsu_mon_s             lsu2brkm_d_mon,         // Data monitor
-    input  logic                                brkm2lsu_i_x_req,       // Instruction breakpoint exception
-    input  logic [SCR1_BRKM_BRKPT_NUMBER-1:0]   brkm2lsu_d_match,       // Data breakpoint(s) match
-    input  logic                                brkm2lsu_d_x_req,       // Data breakpoint exception
-    output logic [SCR1_BRKM_BRKPT_NUMBER-1:0]   exu2brkm_bp_retire,     // Instruction with breakpoint flag retire
-    output logic                                exu2brkm_bp_i_recover,  // Instruction breakpoint state recover
+    // EXU <-> TDU interface
+    output type_scr1_brkm_instr_mon_s           exu2tdu_i_mon,          // Instruction monitor
+    input  logic [SCR1_TDU_ALLTRIG_NUM-1:0]     tdu2exu_i_match,        // Instruction breakpoint(s) match
+    input  logic                                tdu2exu_i_x_req,        // Instruction breakpoint exception
+    output type_scr1_brkm_lsu_mon_s             lsu2tdu_d_mon,          // Data monitor
+    input  logic                                tdu2lsu_i_x_req,        // Instruction breakpoint exception
+    input  logic [SCR1_TDU_MTRIG_NUM-1:0]       tdu2lsu_d_match,        // Data breakpoint(s) match
+    input  logic                                tdu2lsu_d_x_req,        // Data breakpoint exception
+    output logic [SCR1_TDU_ALLTRIG_NUM-1:0]     exu2tdu_bp_retire,      // Instruction with breakpoint flag retire
+    output logic                                exu2tdu_bp_i_recover,   // Instruction breakpoint state recover
     output logic                                brkpt_hw,               // Hardware breakpoint on current instruction
 `endif // SCR1_BRKM_EN
 
@@ -139,6 +138,11 @@ localparam SCR1_JUMP_MASK = `SCR1_XLEN'hFFFF_FFFE;
 logic                           exu_queue_vd;
 type_scr1_exu_cmd_s             exu_queue;
 logic                           queue_barrier;
+
+`ifndef SCR1_EXU_STAGE_BYPASS
+logic                           idu2exu_use_rs1_r;
+logic                           idu2exu_use_rs2_r;
+`endif // SCR1_EXU_STAGE_BYPASS
 
 logic                           exu_rdy;
 
@@ -194,7 +198,7 @@ logic                           exu_exc_req_r;
 
 assign queue_barrier    =   wfi_halted | wfi_run2halt | wfi_run_start
 `ifdef SCR1_DBGC_EN
-                            | dbg_halted | dbg_run2halt | (dbg_run_start & ~fetch_dbgc)
+                            | dbg_halted | dbg_run2halt | (dbg_run_start & ~fetch_pbuf)
 `endif // SCR1_DBGC_EN
 ;
 assign exu2idu_rdy      = exu_rdy & ~queue_barrier;
@@ -228,6 +232,8 @@ always_ff @(posedge clk) begin
         exu_queue.wfi_req        <= idu2exu_cmd.wfi_req;
         exu_queue.exc_req        <= idu2exu_cmd.exc_req;
         exu_queue.exc_code       <= idu2exu_cmd.exc_code;
+        idu2exu_use_rs1_r        <= idu2exu_use_rs1;
+        idu2exu_use_rs2_r        <= idu2exu_use_rs2;
         if (idu2exu_use_rs1) begin
             exu_queue.rs1_addr   <= idu2exu_cmd.rs1_addr;
         end
@@ -247,7 +253,7 @@ end
 
 assign queue_barrier    =   wfi_halted | wfi_run_start
 `ifdef SCR1_DBGC_EN
-                            | dbg_halted | (dbg_run_start & ~fetch_dbgc)
+                            | dbg_halted | (dbg_run_start & ~fetch_pbuf)
 `endif // SCR1_DBGC_EN
 ;
 assign exu2idu_rdy      = exu_rdy & ~queue_barrier;
@@ -259,29 +265,25 @@ assign exu_queue        = idu2exu_cmd;
 
 `ifdef SCR1_BRKM_EN
 //-------------------------------------------------------------------------------
-// Interface to Hardware Breakpoint Module (BRKM)
+// Interface to Trigger debug Unit (TDU)
 //-------------------------------------------------------------------------------
 
 // Instruction monitor
-assign exu2brkm_i_mon.vd     = exu_queue_vd;
-assign exu2brkm_i_mon.addr   = curr_pc;
-`ifdef SCR1_RVC_EXT
-assign exu2brkm_i_mon.width  = exu_queue.instr_rvc ? SCR1_OP_WIDTH_HALF : SCR1_OP_WIDTH_WORD;
-`else
-assign exu2brkm_i_mon.width  = SCR1_OP_WIDTH_WORD;
-`endif // SCR1_RVC_EXT
+assign exu2tdu_i_mon.vd     = exu_queue_vd;
+assign exu2tdu_i_mon.req    = instret;
+assign exu2tdu_i_mon.addr   = curr_pc;
 
 always_comb begin
-    exu2brkm_bp_retire = '0;
+    exu2tdu_bp_retire = '0;
     if (exu_queue_vd) begin
-        exu2brkm_bp_retire = brkm2exu_i_match;
+        exu2tdu_bp_retire = tdu2exu_i_match;
         if (lsu_req) begin
-            exu2brkm_bp_retire |= brkm2lsu_d_match;
+            exu2tdu_bp_retire[SCR1_TDU_MTRIG_NUM-1:0] |= tdu2lsu_d_match;
         end
     end
 end
 
-assign exu2brkm_bp_i_recover = 1'b0;
+assign exu2tdu_bp_i_recover = 1'b0;
 
 `endif // SCR1_BRKM_EN
 
@@ -298,6 +300,10 @@ always_comb begin
         ialu_op1 = mprf2exu_rs1_data;
         ialu_op2 = exu_queue.imm;
     end
+`ifdef SCR1_RVM_EXT
+    ialu_op1 = ialu_vd ? ialu_op1 : '0;
+    ialu_op2 = ialu_vd ? ialu_op2 : '0;
+`endif // SCR1_RVM_EXT
     // SUM2
     if (exu_queue.sum2_op == SCR1_SUM2_OP_REG_IMM) begin
         ialu_sum2_op1 = mprf2exu_rs1_data;
@@ -308,8 +314,13 @@ always_comb begin
     end
 end
 
-assign exu2mprf_rs1_addr    = `SCR1_MPRF_ADDR_WIDTH'(exu_queue.rs1_addr);
-assign exu2mprf_rs2_addr    = `SCR1_MPRF_ADDR_WIDTH'(exu_queue.rs2_addr);
+`ifdef SCR1_EXU_STAGE_BYPASS
+assign exu2mprf_rs1_addr    = (exu_queue_vd & idu2exu_use_rs1) ? `SCR1_MPRF_ADDR_WIDTH'(exu_queue.rs1_addr) : '0;
+assign exu2mprf_rs2_addr    = (exu_queue_vd & idu2exu_use_rs2) ? `SCR1_MPRF_ADDR_WIDTH'(exu_queue.rs2_addr) : '0;
+`else // SCR1_EXU_STAGE_BYPASS
+assign exu2mprf_rs1_addr    = (exu_queue_vd & idu2exu_use_rs1_r) ? `SCR1_MPRF_ADDR_WIDTH'(exu_queue.rs1_addr) : '0;
+assign exu2mprf_rs2_addr    = (exu_queue_vd & idu2exu_use_rs2_r) ? `SCR1_MPRF_ADDR_WIDTH'(exu_queue.rs2_addr) : '0;
+`endif // SCR1_EXU_STAGE_BYPASS
 
 
 //-------------------------------------------------------------------------------
@@ -318,7 +329,7 @@ assign exu2mprf_rs2_addr    = `SCR1_MPRF_ADDR_WIDTH'(exu_queue.rs2_addr);
 `ifdef SCR1_RVM_EXT
 assign ialu_vd  = exu_queue_vd & (exu_queue.ialu_cmd != SCR1_IALU_CMD_NONE)
 `ifdef SCR1_BRKM_EN
-                & ~brkpt_hw
+                & ~tdu2exu_i_x_req
 `endif // SCR1_BRKM_EN
                 ;
 `endif // SCR1_RVM_EXT
@@ -367,9 +378,9 @@ scr1_pipe_lsu i_lsu(
     .lsu_busy           (lsu_busy),             // LSU busy
 
 `ifdef SCR1_BRKM_EN
-    .lsu2brkm_d_mon     (lsu2brkm_d_mon),
-    .brkm2lsu_i_x_req   (brkm2lsu_i_x_req),
-    .brkm2lsu_d_x_req   (brkm2lsu_d_x_req),
+    .lsu2tdu_d_mon      (lsu2tdu_d_mon),
+    .tdu2lsu_i_x_req    (tdu2lsu_i_x_req),
+    .tdu2lsu_d_x_req    (tdu2lsu_d_x_req),
 `endif // SCR1_BRKM_EN
 
     .lsu2dmem_req       (exu2dmem_req),         // DMEM request
@@ -412,7 +423,7 @@ always_comb begin
         endcase
     end // exu_queue_vd
 `ifdef SCR1_BRKM_EN
-    if (brkpt_hw) begin
+    if (tdu2exu_i_x_req) begin
         exu2csr_r_req   = 1'b0;
         exu2csr_w_req   = 1'b0;
     end
@@ -506,8 +517,8 @@ always_comb begin
 `endif // SCR1_MTVAL_ILLEGAL_INSTR_EN
 `ifdef SCR1_BRKM_EN
         SCR1_EXC_CODE_BREAKPOINT            : begin
-            if (brkm2exu_i_x_req)           exu2csr_trap_val    = curr_pc;
-            else if (brkm2lsu_d_x_req)      exu2csr_trap_val    = ialu_sum2_res;
+            if (tdu2exu_i_x_req)           exu2csr_trap_val    = curr_pc;
+            else if (tdu2lsu_d_x_req)      exu2csr_trap_val    = ialu_sum2_res;
             else                            exu2csr_trap_val    = '0;
         end
 `endif // SCR1_BRKM_EN
@@ -522,10 +533,9 @@ end
 // MRET
 assign exu2csr_mret_instr = exu_queue_vd & exu_queue.mret_req
 `ifdef SCR1_BRKM_EN
-    & ~brkpt_hw
+    & ~tdu2exu_i_x_req
 `endif // SCR1_BRKM_EN
 `ifdef SCR1_DBGC_EN
-    & ~exu_no_commit
     & ~dbg_halted
 `endif // SCR1_DBGC_EN
     ;
@@ -552,20 +562,18 @@ assign new_pc_req   = init_pc                                      // reset
 `endif // SCR1_CLKCTRL_EN
                         )
 `ifdef SCR1_DBGC_EN
-                    | (dbg_run_start & ~fetch_dbgc)                 // debug halt exit
+                    | (dbg_run_start & ~fetch_pbuf)                 // debug halt exit to RUN state
 `endif // SCR1_DBGC_EN
                     | (exu_queue_vd & (exu_queue.jump_req | (exu_queue.branch_req & ialu_cmp)));    // jump / branch
 
 assign exu2csr_take_exc     = exc_req
 `ifdef SCR1_DBGC_EN
-                            & ~exu_no_commit
                             & ~dbg_halted
 `endif // SCR1_DBGC_EN
                             ;
 assign exu2csr_mret_update  = exu2csr_mret_instr & (csr_access == SCR1_CSR_INIT);
 assign exu2csr_take_irq     = csr2exu_irq & ~exu_busy
 `ifdef SCR1_DBGC_EN
-                            & ~exu_no_commit
                             & ~exu_irq_dsbl
                             & ~dbg_halted
 `endif // SCR1_DBGC_EN
@@ -582,7 +590,7 @@ always_comb begin
         exu2csr_take_irq,
         exu2csr_mret_instr      : new_pc = csr2exu_new_pc;
 `ifdef SCR1_DBGC_EN
-        (dbg_run_start & ~fetch_dbgc),
+        (dbg_run_start & ~fetch_pbuf): new_pc = dbg_new_pc;
 `endif // SCR1_DBGC_EN
         wfi_run_start           : new_pc = curr_pc;
         exu_queue.fencei_req    : new_pc = inc_pc;
@@ -606,12 +614,20 @@ always_ff @(negedge rst_n, posedge clk) begin
     if (~rst_n) begin
         curr_pc    <= SCR1_RST_VECTOR;
     end else begin
-        if ((instret | exu2csr_take_irq)
+        if ((instret | exu2csr_take_irq
 `ifdef SCR1_DBGC_EN
-        & ~exu_pc_advmt_dsbl & ~exu_no_commit
+        | (dbg_run_start & ~fetch_pbuf))
+        & (~exu_pc_advmt_dsbl & ~exu_no_commit
 `endif // SCR1_DBGC_EN
-        ) begin
-            curr_pc    <= new_pc_req ? new_pc : inc_pc;
+        )) begin
+            if (new_pc_req) begin
+                curr_pc <= new_pc;
+            end else begin
+                curr_pc[5:0] <= inc_pc[5:0];
+                if (inc_pc[6] ^ curr_pc[6]) begin
+                    curr_pc[`SCR1_XLEN-1:6] <= inc_pc[`SCR1_XLEN-1:6];
+                end
+            end
         end // update PC
     end
 end
@@ -649,9 +665,9 @@ assign exu_exc_req          = exu_queue_vd ? exc_req : exu_exc_req_r;
 `else // SCR1_DBGC_EN
 assign exu_exc_req          = exc_req;
 `endif // SCR1_DBGC_EN
-assign brkpt                = exc_req & (exc_code == SCR1_EXC_CODE_BREAKPOINT);
+assign brkpt                = exu_queue_vd & (exu_queue.exc_code == SCR1_EXC_CODE_BREAKPOINT);
 `ifdef SCR1_BRKM_EN
-assign brkpt_hw             = brkm2exu_i_x_req | brkm2lsu_d_x_req;
+assign brkpt_hw             = tdu2exu_i_x_req | tdu2lsu_d_x_req;
 `endif // SCR1_BRKM_EN
 assign exu_init_pc          = init_pc;
 assign instret              = exu_queue_vd & exu_rdy;
@@ -707,14 +723,18 @@ assign wfi_run_cond     = csr2exu_ip_ie;
 
 assign wfi_run2halt     = ~wfi_halted & wfi_halt_cond;
 
-always_ff @(
+always_ff @(negedge rst_n,
 `ifndef SCR1_CLKCTRL_EN
 posedge clk
 `else // SCR1_CLKCTRL_EN
 posedge clk_alw_on
 `endif // SCR1_CLKCTRL_EN
 ) begin
-    wfi_run_start <= (wfi_halted & wfi_run_cond);
+    if (~rst_n) begin
+        wfi_run_start  <= 1'b0;
+    end else begin
+        wfi_run_start <= (wfi_halted & wfi_run_cond & ~exu2csr_take_irq);
+    end
 end
 
 always_ff @(negedge rst_n,
@@ -754,6 +774,7 @@ assign update_pc_en = (init_pc | instret | exu2csr_take_irq)
                     ;
 assign update_pc    = new_pc_req ? new_pc : inc_pc;
 
+`ifndef VERILATOR
 //-------------------------------------------------------------------------------
 // Assertion
 //-------------------------------------------------------------------------------
@@ -792,12 +813,7 @@ SCR1_SVA_EXU_ONEHOT_EXC : assert property (
     })
     ) else $error("EXU Error: exceptions $onehot0 failed");
 
-`ifdef SCR1_BRKM_EN
-SCR1_SVA_EXU_BRKPT : assert property (
-    @(negedge clk) disable iff (~rst_n)
-    brkpt_hw |-> brkpt
-    ) else $error("EXU Error: brkpt is 0");
-`endif // SCR1_BRKM_EN
+`endif // VERILATOR
 
 `endif // SCR1_SIM_ENV
 

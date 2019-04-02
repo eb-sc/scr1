@@ -1,4 +1,4 @@
-/// Copyright by Syntacore LLC © 2016, 2017. See LICENSE for details
+/// Copyright by Syntacore LLC © 2016-2018. See LICENSE for details
 /// @file       <scr1_mem_axi.sv>
 /// @brief      Memory AXI bridge
 ///
@@ -266,10 +266,10 @@ end
 
 
 generate
-    if (SCR1_AXI_RESP_BP == 1) begin
+    if (SCR1_AXI_RESP_BP == 1) begin : axi_resp_bp
         assign core_rdata = (rvalid & rready & rlast) ? rcvd_rdata : '0;
         assign core_resp  = (axi_reinit) ? SCR1_MEM_RESP_NOTRDY : rcvd_resp;
-    end else begin
+    end else begin : axi_resp_no_bp
         always_ff @(negedge rst_n, posedge clk) begin
             if (~rst_n)              core_resp  <= SCR1_MEM_RESP_NOTRDY;
             else                     core_resp  <= (axi_reinit) ? SCR1_MEM_RESP_NOTRDY : rcvd_resp;
@@ -310,6 +310,7 @@ assign wuser    = '0;
 
 
 `ifdef SCR1_SIM_ENV
+`ifndef VERILATOR
 
 // X checks
 SCR1_SVA_AXI_X_CHECK0  : assert property (@(negedge clk) disable iff (~rst_n)   !$isunknown({core_req, awready, wready, bvalid, arready, rvalid}) )
@@ -323,6 +324,7 @@ SCR1_SVA_AXI_X_CHECK2  : assert property (@(negedge clk) disable iff (~rst_n)   
 SCR1_SVA_AXI_X_CHECK3  : assert property (@(negedge clk) disable iff (~rst_n)   rvalid |->
                                                                                     !$isunknown({rid, rresp}) )
                                                                                                         else $error("AXI bridge: X state on input");
+`endif // VERILATOR
 `endif // SCR1_SIM_ENV
 
 endmodule : scr1_mem_axi

@@ -1,8 +1,11 @@
-/// Copyright by Syntacore LLC © 2016, 2017. See LICENSE for details
+/// Copyright by Syntacore LLC © 2016-2019. See LICENSE for details
 /// @file       <scr1_tapc_shift_reg.sv>
-/// @brief      TAPC Shift register. Parameterized implementation of JTAG TAPC's Shift Register.
+/// @brief      TAPC shift register. Parameterized implementation of JTAG TAPC's Shift Register.
 ///
 
+`include "scr1_arch_description.svh"
+
+`ifdef SCR1_DBGC_EN
 module scr1_tapc_shift_reg #(
     parameter   int unsigned            SCR1_WIDTH       = 8,   // Register width, bits
     parameter   logic [SCR1_WIDTH-1:0]  SCR1_RESET_VALUE = '0   // Register's value after reset
@@ -83,6 +86,7 @@ assign dout_parallel = shift_reg;
 assign dout_serial = shift_reg[0];
 
 `ifdef SCR1_SIM_ENV
+`ifndef VERILATOR
 //-------------------------------------------------------------------------------
 // Assertion
 //-------------------------------------------------------------------------------
@@ -102,6 +106,9 @@ SCR1_SVA_TAPC_SHIFTREG_XCHECK : assert property (
     $error("TAPC Shift Reg error: unknown values");
 end
 
+`endif // VERILATOR
 `endif // SCR1_SIM_ENV
 
 endmodule : scr1_tapc_shift_reg
+
+`endif // SCR1_DBGC_EN

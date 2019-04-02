@@ -1,6 +1,6 @@
-/// Copyright by Syntacore LLC © 2016, 2017. See LICENSE for details
+/// Copyright by Syntacore LLC © 2016-2018. See LICENSE for details
 /// @file       <scr1_pipe_idu.sv>
-/// @brief      Instruction Decoder Unit
+/// @brief      Instruction Decoder Unit (IDU)
 ///
 
 `include "scr1_memif.svh"
@@ -829,6 +829,7 @@ always_comb begin
 end // RV32I(MC) decode
 
 `ifdef SCR1_SIM_ENV
+`ifndef VERILATOR
 //-------------------------------------------------------------------------------
 // Assertion
 //-------------------------------------------------------------------------------
@@ -860,6 +861,7 @@ SCR1_SVA_IDU_IALU_CMD_RANGE : assert property (
         ))
     ) else $error("IDU Error: IALU_CMD out of range");
 
+`endif // VERILATOR
 `endif // SCR1_SIM_ENV
 
 endmodule : scr1_pipe_idu

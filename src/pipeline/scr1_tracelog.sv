@@ -1,4 +1,4 @@
-/// Copyright by Syntacore LLC © 2016, 2017. See LICENSE for details
+/// Copyright by Syntacore LLC © 2016-2018. See LICENSE for details
 /// @file       <scr1_tracelog.sv>
 /// @brief      Core tracelog module
 ///
@@ -199,7 +199,9 @@ assign trace_update = update_pc_en | (mprf_wr_en & ~mstatus_mie_up);
 int unsigned temp_fhandler;
 
 initial begin
+`ifndef VERILATOR
     #1 hart.hextoa(fuse_mhartid);
+`endif // VERILATOR
 
 `ifdef SCR1_TRACE_LOG_FULL
     tracelog_full   = 1'b1;

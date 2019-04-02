@@ -1,6 +1,6 @@
-/// Copyright by Syntacore LLC © 2016, 2017. See LICENSE for details
+/// Copyright by Syntacore LLC © 2016-2019. See LICENSE for details
 /// @file       <scr1_pipe_csr.sv>
-/// @brief      Control Status Registers
+/// @brief      Control Status Registers (CSR)
 ///
 
 `include "scr1_arch_description.svh"
@@ -11,10 +11,10 @@
 `include "scr1_ipic.svh"
 `endif // SCR1_IPIC_EN
 `ifdef SCR1_DBGC_EN
-`include "scr1_dbgc.svh"
+`include "scr1_hdu.svh"
 `endif // SCR1_DBGC_EN
 `ifdef SCR1_BRKM_EN
-`include "scr1_brkm.svh"
+`include "scr1_tdu.svh"
 `endif // SCR1_BRKM_EN
 
 module scr1_pipe_csr (
@@ -39,6 +39,9 @@ module scr1_pipe_csr (
     input   logic                                       exu2csr_take_exc,       // Take exception trap
     input   logic                                       exu2csr_mret_update,    // MRET update CSR
     input   logic                                       exu2csr_mret_instr,     // MRET instruction
+`ifdef SCR1_DBGC_EN
+    input   logic                                       exu_no_commit,          // Forbid instruction commitment
+`endif // SCR1_DBGC_EN
     input   type_scr1_exc_code_e                        exu2csr_exc_code,       // Exception code (see scr1_arch_types.svh)
     input   logic [`SCR1_XLEN-1:0]                      exu2csr_trap_val,       // Trap value
     output  logic [`SCR1_XLEN-1:0]                      csr2exu_new_pc,         // Exception/IRQ/MRET new PC
@@ -71,20 +74,23 @@ module scr1_pipe_csr (
     input   logic [63:0]                                mtime_ext,              // External timer value
 
 `ifdef SCR1_DBGC_EN
-    // CSR <-> DBGA interface
-    input   logic [SCR1_DBGC_DBG_DATA_REG_WIDTH-1:0]    dbga2csr_ddr,           // DBGA read data
-    output  logic [SCR1_DBGC_DBG_DATA_REG_WIDTH-1:0]    csr2dbga_ddr,           // DBGA write data
-    output  logic                                       csr2dbga_ddr_we,        // DBGA write request
+    // CSR <-> HDU interface
+    output  logic                                       csr2hdu_req,           // Request to HDU
+    output  type_scr1_csr_cmd_sel_e                     csr2hdu_cmd,           // HDU command
+    output  logic [SCR1_HDU_DEBUGCSR_ADDR_WIDTH-1:0]    csr2hdu_addr,          // HDU address
+    output  logic [`SCR1_XLEN-1:0]                      csr2hdu_wdata,         // HDU write data
+    input   logic [`SCR1_XLEN-1:0]                      hdu2csr_rdata,         // HDU read data
+    input   type_scr1_csr_resp_e                        hdu2csr_resp,          // HDU response
 `endif // SCR1_DBGC_EN
 
 `ifdef SCR1_BRKM_EN
-    // CSR <-> BRKM interface
-    output  logic                                       csr2brkm_req,           // Request to BRKM
-    output  type_scr1_csr_cmd_sel_e                     csr2brkm_cmd,           // BRKM command
-    output  logic [SCR1_BRKM_PKG_CSR_OFFS_WIDTH-1:0]    csr2brkm_addr,          // BRKM address
-    output  logic [SCR1_BRKM_PKG_CSR_DATA_WIDTH-1:0]    csr2brkm_wdata,         // BRKM write data
-    input   logic [SCR1_BRKM_PKG_CSR_DATA_WIDTH-1:0]    brkm2csr_rdata,         // BRKM read data
-    input   type_scr1_csr_resp_e                        brkm2csr_resp,          // BRKM response
+    // CSR <-> TDU interface
+    output  logic                                       csr2tdu_req,           // Request to TDU
+    output  type_scr1_csr_cmd_sel_e                     csr2tdu_cmd,           // TDU command
+    output  logic [SCR1_CSR_ADDR_TDU_OFFS_W-1:0]        csr2tdu_addr,          // TDU address
+    output  logic [`SCR1_XLEN-1:0]                      csr2tdu_wdata,         // TDU write data
+    input   logic [`SCR1_XLEN-1:0]                      tdu2csr_rdata,         // TDU read data
+    input   type_scr1_csr_resp_e                        tdu2csr_resp,          // TDU response
 `endif // SCR1_BRKM_EN
 
     // MHARTID fuse
@@ -119,11 +125,21 @@ logic                                               csr_mtvec_mode;     // MTVEC
 logic                                               csr_mip_mtip;       // MIP: Machine timer interrupt pending
 logic                                               csr_mip_meip;       // MIP: Machine external interrupt pending
 logic                                               csr_mip_msip;       // MIP: Machine software interrupt pending
+
 `ifndef SCR1_CSR_REDUCED_CNT
+
 logic [SCR1_CSR_COUNTERS_WIDTH-1:0]                 csr_instret;        // INSTRET
-logic [SCR1_CSR_COUNTERS_WIDTH-1:0]                 csr_instret_new;
+logic [SCR1_CSR_COUNTERS_WIDTH-1:8]                 csr_instret_hi;
+logic [SCR1_CSR_COUNTERS_WIDTH-1:8]                 csr_instret_hi_new;
+logic [7:0]                                         csr_instret_lo;
+logic [7:0]                                         csr_instret_lo_new;
+
 logic [SCR1_CSR_COUNTERS_WIDTH-1:0]                 csr_cycle;          // CYCLE
-logic [SCR1_CSR_COUNTERS_WIDTH-1:0]                 csr_cycle_new;
+logic [SCR1_CSR_COUNTERS_WIDTH-1:8]                 csr_cycle_hi;
+logic [SCR1_CSR_COUNTERS_WIDTH-1:8]                 csr_cycle_hi_new;
+logic [7:0]                                         csr_cycle_lo;
+logic [7:0]                                         csr_cycle_lo_new;
+
 `endif // ~SCR1_CSR_REDUCED_CNT
 
 `ifdef SCR1_CSR_MCOUNTEN_EN
@@ -147,8 +163,10 @@ logic                                               csr_mtvec_up;
 `ifndef SCR1_CSR_REDUCED_CNT
 logic [1:0]                                         csr_cycle_up;
 logic [1:0]                                         csr_instret_up;
-logic                                               csr_cycle_inc;
-logic                                               csr_instret_inc;
+logic                                               csr_cycle_inc_lo;
+logic                                               csr_cycle_inc_hi;
+logic                                               csr_instret_inc_lo;
+logic                                               csr_instret_inc_hi;
 `endif // SCR1_CSR_REDUCED_CNT
 
 `ifdef SCR1_CSR_MCOUNTEN_EN
@@ -162,6 +180,10 @@ logic                                               csr_w_exc;
 logic                                               e_exc;              // Successful exception trap
 logic                                               e_irq;              // Successful IRQ trap
 logic                                               e_mret;             // MRET instruction
+
+`ifdef SCR1_DBGC_EN
+logic                                               csr_hdu_req;
+`endif // SCR1_DBGC_EN
 
 `ifdef SCR1_BRKM_EN
 logic                                               csr_brkm_req;
@@ -205,6 +227,9 @@ always_comb begin
 `ifdef SCR1_IPIC_EN
     csr2ipic_r_req  = 1'b0;
 `endif // SCR1_IPIC_EN
+`ifdef SCR1_DBGC_EN
+    csr_hdu_req    = 1'b0;
+`endif // SCR1_DBGC_EN
 `ifdef SCR1_BRKM_EN
     csr_brkm_req   = 1'b0;
 `endif // SCR1_BRKM_EN
@@ -319,24 +344,24 @@ always_comb begin
 `endif // SCR1_IPIC_EN
 
 `ifdef SCR1_DBGC_EN
-        // Debug Data Register (DDR)
-        SCR1_CSR_ADDR_DBGC_SCRATCH  : begin
-            csr_r_data      = dbga2csr_ddr;
+        SCR1_HDU_DBGCSR_ADDR_DCSR,
+        SCR1_HDU_DBGCSR_ADDR_DPC,
+        SCR1_HDU_DBGCSR_ADDR_DSCRATCH0,
+        SCR1_HDU_DBGCSR_ADDR_DSCRATCH1 : begin
+            // HDU register access
+            csr_hdu_req = 1'b1;
+            csr_r_data  = hdu2csr_rdata;
         end
 `endif // SCR1_DBGC_EN
 
 `ifdef SCR1_BRKM_EN
-        // BRKM registers
-        SCR1_BRKM_PKG_CSR_ADDR_BPSELECT,
-        SCR1_BRKM_PKG_CSR_ADDR_BPCONTROL,
-        SCR1_BRKM_PKG_CSR_ADDR_BPLOADDR,
-        SCR1_BRKM_PKG_CSR_ADDR_BPHIADDR,
-        SCR1_BRKM_PKG_CSR_ADDR_BPLODATA,
-        SCR1_BRKM_PKG_CSR_ADDR_BPHIDATA,
-        SCR1_BRKM_PKG_CSR_ADDR_BPCTRLEXT,
-        SCR1_BRKM_PKG_CSR_ADDR_BRKMCTRL : begin
+        // TDU registers
+        SCR1_CSR_ADDR_TDU_TSELECT,
+        SCR1_CSR_ADDR_TDU_TDATA1,
+        SCR1_CSR_ADDR_TDU_TDATA2,
+        SCR1_CSR_ADDR_TDU_TINFO: begin
             csr_brkm_req    = 1'b1;
-            csr_r_data      = brkm2csr_rdata;
+            csr_r_data      = tdu2csr_rdata;
         end
 `endif // SCR1_BRKM_EN
 
@@ -381,10 +406,6 @@ always_comb begin
 `ifdef SCR1_IPIC_EN
     csr2ipic_w_req      = 1'b0;
 `endif // SCR1_IPIC_EN
-`ifdef SCR1_DBGC_EN
-    csr2dbga_ddr_we     = 1'b0;
-    csr2dbga_ddr        = '0;
-`endif // SCR1_DBGC_EN
 
     if (exu2csr_w_req) begin
         casez (exu2csr_rw_addr)
@@ -460,23 +481,20 @@ always_comb begin
 `endif // SCR1_IPIC_EN
 
 `ifdef SCR1_DBGC_EN
-            // Debug Data Register (DDR)
-            SCR1_CSR_ADDR_DBGC_SCRATCH  : begin
-                csr2dbga_ddr_we = 1'b1;
-                csr2dbga_ddr    = exu2csr_w_data;
+            SCR1_HDU_DBGCSR_ADDR_DCSR,
+            SCR1_HDU_DBGCSR_ADDR_DPC,
+            SCR1_HDU_DBGCSR_ADDR_DSCRATCH0,
+            SCR1_HDU_DBGCSR_ADDR_DSCRATCH1 : begin
             end
 `endif // SCR1_DBGC_EN
 
 `ifdef SCR1_BRKM_EN
-            // BRKM registers
-            SCR1_BRKM_PKG_CSR_ADDR_BPSELECT,
-            SCR1_BRKM_PKG_CSR_ADDR_BPCONTROL,
-            SCR1_BRKM_PKG_CSR_ADDR_BPLOADDR,
-            SCR1_BRKM_PKG_CSR_ADDR_BPHIADDR,
-            SCR1_BRKM_PKG_CSR_ADDR_BPLODATA,
-            SCR1_BRKM_PKG_CSR_ADDR_BPHIDATA,
-            SCR1_BRKM_PKG_CSR_ADDR_BPCTRLEXT,
-            SCR1_BRKM_PKG_CSR_ADDR_BRKMCTRL : begin end
+            // TDU registers
+            SCR1_CSR_ADDR_TDU_TSELECT,
+            SCR1_CSR_ADDR_TDU_TDATA1,
+            SCR1_CSR_ADDR_TDU_TDATA2,
+            SCR1_CSR_ADDR_TDU_TINFO: begin
+            end
 `endif // SCR1_BRKM_EN
 
             default : begin
@@ -488,8 +506,11 @@ end
 
 // CSR exception
 assign csr2exu_rw_exc = csr_r_exc | csr_w_exc
+`ifdef SCR1_DBGC_EN
+                     | ((csr2hdu_req) & (hdu2csr_resp != SCR1_CSR_RESP_OK))
+`endif // SCR1_DBGC_EN
 `ifdef SCR1_BRKM_EN
-                     | ((csr2brkm_req) & (brkm2csr_resp != SCR1_CSR_RESP_OK))
+                     | ((csr2tdu_req) & (tdu2csr_resp != SCR1_CSR_RESP_OK))
 `endif // SCR1_BRKM_EN
                     ;
 
@@ -499,9 +520,21 @@ assign csr2exu_rw_exc = csr_r_exc | csr_w_exc
 assign csr2exu_mstatus_mie_up   = csr_mstatus_up | csr_mie_up | e_mret;
 
 // Event priority
-assign e_exc    = exu2csr_take_exc;
-assign e_irq    = exu2csr_take_irq & ~exu2csr_take_exc;
-assign e_mret   = exu2csr_mret_update;
+assign e_exc    = exu2csr_take_exc
+`ifdef SCR1_DBGC_EN
+                & ~exu_no_commit
+`endif // SCR1_DBGC_EN
+                ;
+assign e_irq    = exu2csr_take_irq & ~exu2csr_take_exc
+`ifdef SCR1_DBGC_EN
+                & ~exu_no_commit
+`endif // SCR1_DBGC_EN
+                ;
+assign e_mret   = exu2csr_mret_update
+`ifdef SCR1_DBGC_EN
+                & ~exu_no_commit
+`endif // SCR1_DBGC_EN
+                ;
 
 // IRQ exception codes priority
 always_comb begin
@@ -628,7 +661,7 @@ always_comb begin
 `else // SCR1_VECT_IRQ_EN
     if (csr_mtvec_mode == SCR1_CSR_MTVEC_MODE_VECTORED) begin
         case (1'b1)
-            e_exc                           : csr2exu_new_pc    = {csr_mtvec_base, SCR1_CSR_MTVEC_BASE_ZERO_BITS'(0)};
+            exu2csr_take_exc                : csr2exu_new_pc    = {csr_mtvec_base, SCR1_CSR_MTVEC_BASE_ZERO_BITS'(0)};
             (csr_mip_meip & csr_mie_meie)   : csr2exu_new_pc    = {csr_mtvec_base, SCR1_EXC_CODE_IRQ_M_EXTERNAL, 2'd0};
             (csr_mip_msip & csr_mie_msie)   : csr2exu_new_pc    = {csr_mtvec_base, SCR1_EXC_CODE_IRQ_M_SOFTWARE, 2'd0};
             (csr_mip_mtip & csr_mie_mtie)   : csr2exu_new_pc    = {csr_mtvec_base, SCR1_EXC_CODE_IRQ_M_TIMER, 2'd0};
@@ -638,7 +671,7 @@ always_comb begin
         csr2exu_new_pc  = {csr_mtvec_base, SCR1_CSR_MTVEC_BASE_ZERO_BITS'(0)};
     end
 `endif // SCR1_VECT_IRQ_EN
-    if (exu2csr_mret_instr & ~e_irq) begin
+    if (exu2csr_mret_instr & ~exu2csr_take_irq) begin
 `ifdef SCR1_RVC_EXT
         csr2exu_new_pc  = {csr_mepc, 1'b0};
 `else // SCR1_RVC_EXT
@@ -696,9 +729,9 @@ end
 
 // MTVEC
 generate
-    if (SCR1_CSR_MTVEC_BASE_RW_BITS == 0) begin
+    if (SCR1_CSR_MTVEC_BASE_RW_BITS == 0) begin : mtvec_base_ro
         assign csr_mtvec_base   = SCR1_CSR_MTVEC_BASE_RST_VAL;
-    end else if (SCR1_CSR_MTVEC_BASE_RW_BITS == SCR1_CSR_MTVEC_BASE_VAL_BITS) begin
+    end else if (SCR1_CSR_MTVEC_BASE_RW_BITS == SCR1_CSR_MTVEC_BASE_VAL_BITS) begin : mtvec_base_rw
         always_ff @(negedge rst_n, posedge clk) begin
             if (~rst_n) begin
                 csr_mtvec_base  <= SCR1_CSR_MTVEC_BASE_RST_VAL;
@@ -708,17 +741,18 @@ generate
                 end
             end
         end
-    end else begin
-        assign csr_mtvec_base[SCR1_CSR_MTVEC_BASE_ZERO_BITS+:SCR1_CSR_MTVEC_BASE_RO_BITS]   = SCR1_CSR_MTVEC_BASE_RST_VAL[SCR1_CSR_MTVEC_BASE_ZERO_BITS+:SCR1_CSR_MTVEC_BASE_RO_BITS];
+    end else begin : mtvec_base_ro_rw
+        logic [(`SCR1_XLEN-1):(`SCR1_XLEN-1)-SCR1_CSR_MTVEC_BASE_RW_BITS]   csr_mtvec_base_reg;
         always_ff @(negedge rst_n, posedge clk) begin
             if (~rst_n) begin
-                csr_mtvec_base[(`SCR1_XLEN-1)-:SCR1_CSR_MTVEC_BASE_RW_BITS] <= SCR1_CSR_MTVEC_BASE_RST_VAL[(`SCR1_XLEN-1)-:SCR1_CSR_MTVEC_BASE_RW_BITS];
+                csr_mtvec_base_reg <= SCR1_CSR_MTVEC_BASE_RST_VAL[(`SCR1_XLEN-1)-:SCR1_CSR_MTVEC_BASE_RW_BITS] ;
             end else begin
                 if (csr_mtvec_up) begin
-                    csr_mtvec_base[(`SCR1_XLEN-1)-:SCR1_CSR_MTVEC_BASE_RW_BITS] <= csr_w_data[(`SCR1_XLEN-1)-:SCR1_CSR_MTVEC_BASE_RW_BITS];
+                    csr_mtvec_base_reg <= csr_w_data[(`SCR1_XLEN-1)-:SCR1_CSR_MTVEC_BASE_RW_BITS];
                 end
             end
         end
+        assign csr_mtvec_base = {csr_mtvec_base_reg, SCR1_CSR_MTVEC_BASE_RST_VAL[SCR1_CSR_MTVEC_BASE_ZERO_BITS+:SCR1_CSR_MTVEC_BASE_RO_BITS]};
     end
 endgenerate
 
@@ -738,21 +772,31 @@ assign csr_mtvec_mode   = SCR1_CSR_MTVEC_MODE_DIRECT;
 
 
 `ifndef SCR1_CSR_REDUCED_CNT
+
 // CYCLE
-assign csr_cycle_inc    = 1'b1
+assign csr_cycle        = {csr_cycle_hi, csr_cycle_lo};
+assign csr_cycle_inc_lo = 1'b1
  `ifdef SCR1_CSR_MCOUNTEN_EN
                         & csr_mcounten_cy
  `endif // SCR1_CSR_MCOUNTEN_EN
                         ;
+assign csr_cycle_inc_hi = csr_cycle_inc_lo & (&csr_cycle_lo);
 
 always_comb begin
-    csr_cycle_new   = csr_cycle;
-    if (csr_cycle_inc) begin
-        csr_cycle_new   = csr_cycle + 1'b1;
-    end
+    csr_cycle_lo_new = csr_cycle_lo;
+    csr_cycle_hi_new = csr_cycle_hi;
+
+    if (csr_cycle_inc_lo)   csr_cycle_lo_new = csr_cycle_lo + 1'b1;
+    if (csr_cycle_inc_hi)   csr_cycle_hi_new = csr_cycle_hi + 1'b1;
+
     case (csr_cycle_up)
-        2'b01   : csr_cycle_new[31:0]   = csr_w_data;
-        2'b10   : csr_cycle_new[63:32]  = csr_w_data;
+        2'b01   : begin
+            csr_cycle_lo_new        = csr_w_data[7:0];
+            csr_cycle_hi_new[31:8]  = csr_w_data[31:8];
+        end
+        2'b10   : begin
+            csr_cycle_hi_new[63:32] = csr_w_data;
+        end
         default : begin end
     endcase
 end
@@ -763,44 +807,56 @@ always_ff @(negedge rst_n, posedge clk) begin
 always_ff @(negedge rst_n, posedge clk_alw_on) begin
 `endif // SCR1_CLKCTRL_EN
     if (~rst_n) begin
-        csr_cycle   <= '0;
+        csr_cycle_lo    <= '0;
+        csr_cycle_hi    <= '0;
     end else begin
-        if (csr_cycle_inc | (|csr_cycle_up)) begin
-            csr_cycle   <= csr_cycle_new;
-        end
+        if (csr_cycle_inc_lo | csr_cycle_up[0]) csr_cycle_lo <= csr_cycle_lo_new;
+        if (csr_cycle_inc_hi | (|csr_cycle_up)) csr_cycle_hi <= csr_cycle_hi_new;
     end
 end
+
 `endif // SCR1_CSR_REDUCED_CNT
 
 `ifndef SCR1_CSR_REDUCED_CNT
+
 // INSTRET
-assign csr_instret_inc  = instret_nexc
+assign csr_instret          = {csr_instret_hi, csr_instret_lo};
+assign csr_instret_inc_lo   = instret_nexc
  `ifdef SCR1_CSR_MCOUNTEN_EN
-                        & csr_mcounten_ir
+                            & csr_mcounten_ir
  `endif // SCR1_CSR_MCOUNTEN_EN
-                        ;
+                            ;
+assign csr_instret_inc_hi   = csr_instret_inc_lo & (&csr_instret_lo);
 
 always_comb begin
-    csr_instret_new = csr_instret;
-    if (csr_instret_inc) begin
-        csr_instret_new = csr_instret + 1'b1;
-    end
+    csr_instret_lo_new = csr_instret_lo;
+    csr_instret_hi_new = csr_instret_hi;
+
+    if (csr_instret_inc_lo) csr_instret_lo_new = csr_instret_lo + 1'b1;
+    if (csr_instret_inc_hi) csr_instret_hi_new = csr_instret_hi + 1'b1;
+
     case (csr_instret_up)
-        2'b01   : csr_instret_new[31:0]     = csr_w_data;
-        2'b10   : csr_instret_new[63:32]    = csr_w_data;
+        2'b01   : begin
+            csr_instret_lo_new          = csr_w_data[7:0];
+            csr_instret_hi_new[31:8]    = csr_w_data[31:8];
+        end
+        2'b10   : begin
+            csr_instret_hi_new[63:32]   = csr_w_data;
+        end
         default : begin end
     endcase
 end
 
 always_ff @(negedge rst_n, posedge clk) begin
     if (~rst_n) begin
-        csr_instret <= '0;
+        csr_instret_lo  <= '0;
+        csr_instret_hi  <= '0;
     end else begin
-        if (csr_instret_inc | (|csr_instret_up)) begin
-            csr_instret <= csr_instret_new;
-        end
+        if (csr_instret_inc_lo | csr_instret_up[0]) csr_instret_lo <= csr_instret_lo_new;
+        if (csr_instret_inc_hi | (|csr_instret_up)) csr_instret_hi <= csr_instret_hi_new;
     end
 end
+
 `endif // SCR1_CSR_REDUCED_CNT
 
 
@@ -813,18 +869,29 @@ assign csr2ipic_wdata   = csr2ipic_w_req                    ? exu2csr_w_data    
 `endif // SCR1_IPIC_EN
 
 
+`ifdef SCR1_DBGC_EN
+//-------------------------------------------------------------------------------
+// HDU
+//-------------------------------------------------------------------------------
+assign csr2hdu_req      = csr_hdu_req & ((exu2csr_r_req & ~csr_r_exc) | (exu2csr_w_req & ~csr_w_exc));
+assign csr2hdu_cmd      = exu2csr_w_cmd;
+assign csr2hdu_addr     = exu2csr_rw_addr[SCR1_HDU_DEBUGCSR_ADDR_WIDTH-1:0];
+assign csr2hdu_wdata    = exu2csr_w_data;
+`endif // SCR1_DBGC_EN
+
 `ifdef SCR1_BRKM_EN
 //-------------------------------------------------------------------------------
-// BRKM
+// TDU
 //-------------------------------------------------------------------------------
-assign csr2brkm_req     = csr_brkm_req & ((exu2csr_r_req & ~csr_r_exc) | (exu2csr_w_req & ~csr_w_exc));
-assign csr2brkm_cmd     = exu2csr_w_cmd;
-assign csr2brkm_addr    = exu2csr_rw_addr[SCR1_BRKM_PKG_CSR_OFFS_WIDTH-1:0];
-assign csr2brkm_wdata   = exu2csr_w_data;
+assign csr2tdu_req      = csr_brkm_req & ((exu2csr_r_req & ~csr_r_exc) | (exu2csr_w_req & ~csr_w_exc));
+assign csr2tdu_cmd      = exu2csr_w_cmd;
+assign csr2tdu_addr     = exu2csr_rw_addr[SCR1_CSR_ADDR_TDU_OFFS_W-1:0];
+assign csr2tdu_wdata    = exu2csr_w_data;
 `endif // SCR1_BRKM_EN
 
 
 `ifdef SCR1_SIM_ENV
+`ifndef VERILATOR
 //-------------------------------------------------------------------------------
 // Assertions
 //-------------------------------------------------------------------------------
@@ -937,6 +1004,7 @@ SCR1_SVA_CSR_CYCLE_INSTRET_UP : assert property (
 
 `endif // SCR1_CSR_REDUCED_CNT
 
+`endif // VERILATOR
 `endif // SCR1_SIM_ENV
 
 endmodule : scr1_pipe_csr

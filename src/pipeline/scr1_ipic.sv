@@ -1,10 +1,13 @@
-/// Copyright by Syntacore LLC © 2016, 2017. See LICENSE for details
+/// Copyright by Syntacore LLC © 2016-2019. See LICENSE for details
 /// @file       <scr1_ipic.sv>
-/// @brief      Integrated Programmable Interrupt Controller
+/// @brief      Integrated Programmable Interrupt Controller (IPIC)
 ///
 
-`include "scr1_ipic.svh"
 `include "scr1_arch_description.svh"
+
+`ifdef SCR1_IPIC_EN
+
+`include "scr1_ipic.svh"
 
 module scr1_ipic
 (
@@ -78,7 +81,7 @@ begin
     logic               stage1_idx [7:0];
     logic [1:0]         stage2_idx [3:0];
     logic [2:0]         stage3_idx [1:0];
-    type_scr1_search_one_16_s tmp;
+    type_scr1_search_one_16_s result;
 
     // Stage 1
     for (int unsigned i=0; i<8; ++i) begin
@@ -105,10 +108,10 @@ begin
     end
 
     // Stage 4
-    tmp.vd = |stage3_vd;
-    tmp.idx = (stage3_vd[0]) ? {1'b0, stage3_idx[0]} : {1'b1, stage3_idx[1]};
+    result.vd = |stage3_vd;
+    result.idx = (stage3_vd[0]) ? {1'b0, stage3_idx[0]} : {1'b1, stage3_idx[1]};
 
-    return tmp;
+    return result;
 end
 endfunction : scr1_search_one_16
 
@@ -133,7 +136,7 @@ logic [SCR1_IRQ_VECT_NUM-1:0]           ipr_m;                  // Interrupt pen
 logic [SCR1_IRQ_VECT_NUM-1:0]           ipr_clr;                // Interrupt pending clr
 
 logic [SCR1_IRQ_VECT_NUM-1:0]           ier;                    // Interrupt enable register(IPIC_IER)
-logic [SCR1_IRQ_VECT_NUM-1:0]           irr_m;                  // Inerrupt register register(IPIC_IPR & IPIC_IER & PRV==M)
+logic [SCR1_IRQ_VECT_NUM-1:0]           irr_m;                  // Interrupt register register(IPIC_IPR & IPIC_IER & PRV==M)
 
 
 logic [SCR1_IRQ_VECT_WIDTH-1:0]         cisv_m;                 // Number of the current M-mode interrupt in service register(IPIC_CISV_M)
@@ -188,7 +191,7 @@ always_comb begin
             end
 
             SCR1_IPIC_ISVR : begin
-                // Agregated serviced interrupts
+                // Aggregated serviced interrupts
                 ipic2csr_rdata = isvr_m;
             end
 
@@ -279,7 +282,7 @@ always_comb begin
             end
 
             SCR1_IPIC_IPR : begin
-                // Agregated pending interrupts
+                // Aggregated pending interrupts
                 ipr_clr = csr2ipic_wdata[SCR1_IRQ_VECT_NUM-1:0];
             end
 
@@ -292,7 +295,7 @@ always_comb begin
                 // Start Of Interrupt
                 if (irr_priority_m.vd) begin
                     for (int unsigned i=0; i<SCR1_IRQ_VECT_NUM; ++i) begin
-                        if (unsigned'(irr_priority_m.idx) == i) begin
+                        if ($unsigned(irr_priority_m.idx) == i) begin
                             soi_wr_m   |= 1'b1;
                             ipr_clr[i] |= 1'b1;
                         end
@@ -388,7 +391,7 @@ end
 assign ipr_m = ipr;
 
 //-------------------------------------------------------------------------------
-// Interrupt Requested Register - just a combinatorial
+// Interrupt Requested Register
 //-------------------------------------------------------------------------------
 assign irr_m    = ipr_m & ier;
 
@@ -401,7 +404,7 @@ assign isvr_priority_eoi_m = scr1_search_one_16(isvr_eoi_m);
 always_comb begin
     isvr_eoi_m = isvr_m;
     for (int unsigned i=0; i<SCR1_IRQ_VECT_NUM; ++i) begin
-        if (i == unsigned'(cisv_m)) begin
+        if (i == $unsigned(cisv_m)) begin
             isvr_eoi_m[i] = 1'b0;
         end
     end
@@ -415,7 +418,7 @@ always_comb begin
         if (~|isvr_m) begin                 // No serviced interrupts
             irq_m_req = 1'b1;
         end else begin                      // There are serviced interrupts
-            if (unsigned'(irr_priority_m.idx) < unsigned'(cisv_m)) begin
+            if ($unsigned(irr_priority_m.idx) < $unsigned(cisv_m)) begin
                 irq_m_req = 1'b1;
             end
         end
@@ -429,7 +432,7 @@ always_ff @(negedge rst_n, posedge clk) begin
     end else begin
         if ((irq_m_req) & (soi_wr_m)) begin
             for (int unsigned i=0; i<SCR1_IRQ_VECT_NUM; ++i) begin
-                if (i == unsigned'(irr_priority_m.idx)) begin
+                if (i == $unsigned(irr_priority_m.idx)) begin
                     isvr_m[i] <= 1'b1;
                 end
             end
@@ -447,3 +450,5 @@ always_ff @(negedge rst_n, posedge clk) begin
 end
 
 endmodule : scr1_ipic
+
+`endif // SCR1_IPIC_EN

@@ -1,7 +1,9 @@
-/// Copyright by Syntacore LLC © 2016, 2017. See LICENSE for details
+/// Copyright by Syntacore LLC © 2016-2018. See LICENSE for details
 /// @file       <scr1_memory_tb_axi.sv>
 /// @brief      AXI memory testbench
 ///
+
+`include "scr1_ipic.svh"
 
 module scr1_memory_tb_axi #(
     parameter SIZE   = 1*1024*1024,
@@ -14,6 +16,9 @@ module scr1_memory_tb_axi #(
     // System
     input   logic                          rst_n,
     input   logic                          clk,
+`ifdef SCR1_IPIC_EN
+    output  logic [SCR1_IRQ_LINES_NUM-1:0] irq_lines,
+`endif // SCR1_IPIC_EN
 
     // Write address channel
     input  logic [N_IF-1:0]                awvalid,
@@ -57,17 +62,24 @@ module scr1_memory_tb_axi #(
 //-------------------------------------------------------------------------------
 // Local parameters
 //-------------------------------------------------------------------------------
-localparam [W_ADR-1:0]                       PRINT_ADDR   = 32'hF000_0000;
+localparam [W_ADR-1:0]                      PRINT_ADDR     = 32'hF000_0000;
+localparam [W_ADR-1:0]                      IRQ_ADDR       = 32'hF000_0100;
 
 //-------------------------------------------------------------------------------
 // Local signal declaration
 //-------------------------------------------------------------------------------
-logic  [7:0]                                 memory [0:SIZE-1];
-logic  [N_IF-1:0] [W_ADR-1:0]                awaddr_hold;
-logic  [N_IF-1:0] [2:0]                      awsize_hold;
-string                                       stuff_file;
-genvar                                       gi;
-genvar                                       gj;
+logic  [7:0]                                memory [0:SIZE-1];
+logic  [N_IF-1:0] [W_ADR-1:0]               awaddr_hold;
+logic  [N_IF-1:0] [2:0]                     awsize_hold;
+genvar                                      gi;
+genvar                                      gj;
+
+`ifdef VERILATOR
+logic [255:0]                               test_file;
+`else // VERILATOR
+string                                      test_file;
+`endif // VERILATOR
+bit                                         test_file_init;
 
 //-------------------------------------------------------------------------------
 // Local functions
@@ -89,7 +101,21 @@ function automatic logic [W_DATA-1:0] mem_read (
     end
 
     for(int i=byte_lane; i<bytes_max & bytes_num!=0; ++i) begin
+`ifdef SCR1_IPIC_EN
+        if (adr[W_ADR-1:1]==IRQ_ADDR[W_ADR-1:1]) begin
+            if( i*8 < SCR1_IRQ_LINES_NUM ) begin
+                if( SCR1_IRQ_LINES_NUM < 8 ) begin
+                    mem_read[(i*8)+:8] = irq_lines;
+                end else begin
+                    mem_read[(i*8)+:8] = irq_lines[(i*8)+:8];
+                end
+            end
+        end else begin
+            mem_read[(i*8)+:8] = memory[adr];
+        end
+`else // SCR1_IPIC_EN
         mem_read[(i*8)+:8] = memory[adr];
+`endif // SCR1_IPIC_EN
         adr = adr+1'b1;
         bytes_num = bytes_num - 1'b1;
     end
@@ -114,6 +140,16 @@ function automatic void mem_write (
     for(int i=byte_lane; i<bytes_max & bytes_num!=0; ++i) begin
         if(bytes_en[i] & adr==PRINT_ADDR) begin
             $write("%c",data[(i*8)+:8]);
+`ifdef SCR1_IPIC_EN
+        end else if(bytes_en[i] & adr[W_ADR-1:1]==IRQ_ADDR[W_ADR-1:1]) begin
+            if( i*8 < SCR1_IRQ_LINES_NUM ) begin
+                if( SCR1_IRQ_LINES_NUM < 8 ) begin
+                    irq_lines = data[SCR1_IRQ_LINES_NUM-1:0];
+                end else begin
+                    irq_lines[(i*8)+:8] = data[(i*8)+:8];
+                end
+            end
+`endif // SCR1_IPIC_EN
         end else if(bytes_en[i]) begin
             memory[adr] = data[(i*8)+:8];
         end
@@ -121,14 +157,6 @@ function automatic void mem_write (
         bytes_num = bytes_num-1'b1;
     end
 endfunction : mem_write
-
-//-------------------------------------------------------------------------------
-// Load file to mem
-//-------------------------------------------------------------------------------
-always @(negedge rst_n) begin
-    memory = '{SIZE{'0}};
-    if(stuff_file.len()>0) $readmemh(stuff_file,memory);
-end
 
 generate for(gi=0; gi<N_IF; ++gi) begin : rw_if
 
@@ -177,6 +205,7 @@ always @(posedge clk, negedge rst_n) begin
         bresp[gi]   <= 2'd3;
         awready[gi] <= 1'b1;
         wready[gi]  <= 1'b1;
+        if (test_file_init) $readmemh(test_file, memory);
     end else begin
 
         // Write data: response
@@ -213,13 +242,15 @@ always @(posedge clk, negedge rst_n) begin
     end
 end
 
+`ifndef VERILATOR
 //-------------------------------------------------------------------------------
 // Assertions
 //-------------------------------------------------------------------------------
 SVA_TBMEM_AWADDR_404 :
     assert property (
         @(negedge clk) disable iff (~rst_n)
-        awvalid[gi] |-> awaddr[gi]<SIZE | awaddr[gi]==PRINT_ADDR
+        awvalid[gi] |-> awaddr[gi]<SIZE | awaddr[gi]==PRINT_ADDR |
+        awaddr[gi]==IRQ_ADDR
     )
     else $error("TBMEM: awaddr[%0d] >= SIZE",gi);
 
@@ -277,7 +308,8 @@ SVA_TBMEM_X_BREADY :
 SVA_TBMEM_ARADDR_404 :
     assert property (
         @(negedge clk) disable iff (~rst_n)
-        arvalid[gi] |-> araddr[gi]<SIZE | araddr[gi]==PRINT_ADDR
+        arvalid[gi] |-> araddr[gi]<SIZE | araddr[gi]==PRINT_ADDR |
+        awaddr[gi]==IRQ_ADDR
     )
     else $error("TBMEM: awaddr[%0d] >= SIZE",gi);
 
@@ -308,6 +340,8 @@ SVA_TBMEM_X_RREADY :
         rvalid[gi] |-> !$isunknown(rready[gi])
     )
     else $error("TBMEM: X state on rready[%0d]",gi);
+
+`endif // VERILATOR
 
 end endgenerate
 

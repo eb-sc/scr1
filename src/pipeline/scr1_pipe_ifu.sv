@@ -1,10 +1,13 @@
-/// Copyright by Syntacore LLC © 2016, 2017. See LICENSE for details
+/// Copyright by Syntacore LLC © 2016-2019. See LICENSE for details
 /// @file       <scr1_pipe_ifu.sv>
-/// @brief      Instruction Fetch Unit
+/// @brief      Instruction Fetch Unit (IFU)
 ///
 
 `include "scr1_memif.svh"
 `include "scr1_arch_description.svh"
+`ifdef SCR1_DBGC_EN
+`include "scr1_hdu.svh"
+`endif // SCR1_DBGC_EN
 
 module scr1_pipe_ifu
 (
@@ -23,8 +26,11 @@ module scr1_pipe_ifu
     input   logic [`SCR1_XLEN-1:0]              new_pc,             // New PC
     input   logic                               stop_fetch,         // Stop IFU
 `ifdef SCR1_DBGC_EN
-    input   logic                               fetch_dbgc,         // Fetch instructions provided by DBGC
-    input   logic [`SCR1_IMEM_DWIDTH-1:0]       dbgc_instr,
+    input   logic                               fetch_pbuf,         // Fetch instructions provided by Program Buffer
+    output  logic                               ifu2hdu_pbuf_rdy,
+    input   logic                               hdu2ifu_pbuf_vd,
+    input   logic                               hdu2ifu_pbuf_err,
+    input   logic [SCR1_HDU_CORE_INSTR_WIDTH-1:0] hdu2ifu_pbuf_instr,
 `endif // SCR1_DBGC_EN
 `ifdef SCR1_CLKCTRL_EN
     output  logic                               imem_txns_pending,  // There are pending imem transactions
@@ -106,7 +112,9 @@ typedef enum logic [2:0] {
 
 type_scr1_ifu_fsm_e                 fsm;
 logic [`SCR1_XLEN-1:2]              imem_addr_r;
+logic [`SCR1_XLEN-1:2]              imem_addr_r_new;
 logic [SCR1_TXN_CNT_W-1:0]          num_txns_pending;           // Transactions sent but not yet returned
+logic [SCR1_TXN_CNT_W-1:0]          num_txns_pending_new;
 logic [SCR1_TXN_CNT_W-1:0]          discard_resp_cnt;           // Number of imem responses to discard
 logic [SCR1_TXN_CNT_W-1:0]          discard_resp_cnt_new;
 logic                               discard_resp;
@@ -349,7 +357,7 @@ end
 // Instruction memory interface logic
 //-------------------------------------------------------------------------------
 
-assign imem_req = (new_pc_req & ~num_txns_pending_full) |
+assign imem_req = (new_pc_req & ~num_txns_pending_full & ~stop_fetch) |
 (
     (fsm == SCR1_FSM_FETCH) &
     ~num_txns_pending_full &
@@ -367,6 +375,7 @@ assign num_txns_pending_full    = &num_txns_pending;
 assign imem_txns_pending        = |num_txns_pending;
 `endif // SCR1_CLKCTRL_EN
 
+assign imem_addr_r_new = (new_pc_req ? new_pc[`SCR1_XLEN-1:2] : imem_addr_r) + 1'b1;
 
 always_ff @(posedge clk, negedge rst_n) begin
     if (~rst_n) begin
@@ -374,56 +383,47 @@ always_ff @(posedge clk, negedge rst_n) begin
     end else begin
         if (imem_req & imem_req_ack) begin
             // if req & ack, store either incremented new_pc or incremented address
-            imem_addr_r <= (new_pc_req ? new_pc[`SCR1_XLEN-1:2] : imem_addr_r) + 1'b1;
+            if (new_pc_req) begin
+                imem_addr_r <= imem_addr_r_new;
+            end else begin
+                imem_addr_r[5:2] <= imem_addr_r_new[5:2];
+                if (&imem_addr_r[5:2]) begin
+                    imem_addr_r[`SCR1_XLEN-1:6] <= imem_addr_r_new[`SCR1_XLEN-1:6];
+                end
+            end
         end else if (new_pc_req) begin
             imem_addr_r <= new_pc[`SCR1_XLEN-1:2];
         end
     end
 end
 
+assign num_txns_pending_new = num_txns_pending + (imem_req & imem_req_ack) - (imem_resp_ok | imem_resp_er);
+
 always_ff @(posedge clk, negedge rst_n) begin
     if (~rst_n) begin
         num_txns_pending <= '0;
-    end else begin
-        case ({(imem_req & imem_req_ack), (imem_resp_ok | imem_resp_er)})
-            2'b00,
-            2'b11   : begin // simultaneous response and accepted request
-                      end
-            default : num_txns_pending <=   ((imem_resp_ok | imem_resp_er) ?
-                                                (num_txns_pending - 1'b1) :
-                                                (num_txns_pending + 1'b1));
-        endcase
+    end else if ((imem_req & imem_req_ack) ^ (imem_resp_ok | imem_resp_er)) begin
+        num_txns_pending <= num_txns_pending_new;
     end
 end
 
-// discard_resp_cnt sub
-always_comb begin
-    logic [SCR1_TXN_CNT_W-1:0]  op_a;
-    logic                       op_b;
 
-    op_a    = discard_resp_cnt;
-    op_b    = 1'b0;
+always_comb begin
     if (new_pc_req) begin
-        op_a    = num_txns_pending;
-        op_b    = (imem_resp_ok | imem_resp_er);
-    end else if (imem_resp_er) begin
-        op_a    = num_txns_pending;
-        op_b    = ~(imem_req & imem_req_ack);
-    end else if (imem_resp_ok & discard_resp) begin
-        op_a    = discard_resp_cnt;
-        op_b    = 1'b1;
+        discard_resp_cnt_new = num_txns_pending_new - (imem_req & imem_req_ack);
+    end else if (imem_resp_er & ~discard_resp) begin
+        discard_resp_cnt_new = num_txns_pending_new;
+    end else begin
+        discard_resp_cnt_new = discard_resp_cnt - 1'b1;
     end
-    discard_resp_cnt_new    = op_a - op_b;
 end
 
 always_ff @(posedge clk, negedge rst_n) begin
     if (~rst_n) begin
         discard_resp_cnt <= '0;
-    end else begin
-        if (new_pc_req | imem_resp_er | (imem_resp_ok & discard_resp)) begin
-            discard_resp_cnt    <= discard_resp_cnt_new;
-        end
-    end // rst_n
+    end else if (new_pc_req | imem_resp_er | (imem_resp_ok & discard_resp)) begin
+        discard_resp_cnt <= discard_resp_cnt_new;
+    end
 end
 
 assign num_vd_txns_pending  = num_txns_pending - discard_resp_cnt;
@@ -493,9 +493,9 @@ always_comb begin
         end // ~q_empty
     end
 `ifdef SCR1_DBGC_EN
-    if (fetch_dbgc) begin
-        ifu2idu_vd          = 1'b1;
-        ifu2idu_imem_err    = 1'b0;
+    if (fetch_pbuf) begin
+        ifu2idu_vd          = hdu2ifu_pbuf_vd;
+        ifu2idu_imem_err    = hdu2ifu_pbuf_err;
     end
 `endif // SCR1_DBGC_EN
 end
@@ -516,8 +516,8 @@ always_comb begin
         end
     endcase // instr_bypass
 `ifdef SCR1_DBGC_EN
-    if (fetch_dbgc) begin
-        ifu2idu_instr = dbgc_instr;
+    if (fetch_pbuf) begin
+        ifu2idu_instr = `SCR1_IMEM_DWIDTH'({'0, hdu2ifu_pbuf_instr});
     end
 `endif // SCR1_DBGC_EN
 end
@@ -539,9 +539,9 @@ always_comb begin
         end
     end // ~q_empty
 `ifdef SCR1_DBGC_EN
-    if (fetch_dbgc) begin
-        ifu2idu_vd          = 1'b1;
-        ifu2idu_imem_err    = 1'b0;
+    if (fetch_pbuf) begin
+        ifu2idu_vd          = hdu2ifu_pbuf_vd;
+        ifu2idu_imem_err    = hdu2ifu_pbuf_err;
     end
 `endif // SCR1_DBGC_EN
 end
@@ -549,16 +549,20 @@ end
 always_comb begin
     ifu2idu_instr = q_head_rvc ? `SCR1_IMEM_DWIDTH'(q_data_head) : {q_data_next, q_data_head};
 `ifdef SCR1_DBGC_EN
-    if (fetch_dbgc) begin
-        ifu2idu_instr = dbgc_instr;
+    if (fetch_pbuf) begin
+        ifu2idu_instr = `SCR1_IMEM_DWIDTH'({'0, hdu2ifu_pbuf_instr});
     end
 `endif // SCR1_DBGC_EN
 end
 
 `endif  // SCR1_IFU_QUEUE_BYPASS
 
+`ifdef SCR1_DBGC_EN
+assign ifu2hdu_pbuf_rdy = idu2ifu_rdy;
+`endif // SCR1_DBGC_EN
 
 `ifdef SCR1_SIM_ENV
+`ifndef VERILATOR
 //-------------------------------------------------------------------------------
 // Assertion
 //-------------------------------------------------------------------------------
@@ -619,6 +623,7 @@ SCR1_SVA_IFU_IMEM_FAULT_RVI_HI : assert property (
     ifu2idu_err_rvi_hi |-> ifu2idu_imem_err
     ) else $error("IFU Error: ifu2idu_imem_err == 0");
 
+`endif // VERILATOR
 `endif // SCR1_SIM_ENV
 
 endmodule : scr1_pipe_ifu
